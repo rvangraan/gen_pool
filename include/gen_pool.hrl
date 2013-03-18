@@ -28,6 +28,7 @@
 	       resource_pool_pid,
 	       debug   = false,
 	       enabled = false,
+	       pool_state,
 	       parameters = []
 	     }).
   

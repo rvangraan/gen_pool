@@ -1,0 +1,11 @@
+{application, gen_pool,
+   [{description, "Generic Resource Pool"},
+    {vsn, "1.0.0"},
+    {modules, 
+	[]},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {mod,{pool_appsup,[]}},
+    {env, []}
+]}.
+
