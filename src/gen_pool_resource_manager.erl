@@ -1,7 +1,7 @@
 %%% @author Rudolph van Graan <rvg@wyemac.local>
 %%% @copyright (C) 2013, Rudolph van Graan
 %%% @doc
-%%%
+%%% This is 
 %%% @end
 %%% Created : 15 Mar 2013 by Rudolph van Graan <rvg@wyemac.local>
 
@@ -31,6 +31,11 @@
 	 is_online/2]).
 
 %%--------------------------------------------------------------------
+%% Resource API
+
+-export([resource_change_state/2]).
+
+%%--------------------------------------------------------------------
 
 -export(['$notify_resource_state'/2,
 	 '$get_all_resources'/1,
@@ -53,16 +58,25 @@
 -record(state, { configuration,
 		 min_pool_size,
 		 max_pool_size,
+		 behaviour_mod,
 		 resource_sup,
 		 notify_completion,
 		 debug = false,
-		 owner,
+		 resource_pool_pid,
+		 behaviour_state,
+		 online_count = 0,
 		 resources_table = [] }).
 
 %%====================================================================
 %% API
 %%====================================================================
 
+where(GroupName) when is_atom(GroupName) ->
+    gproc:where({n,l,{pool_manager, GroupName}});
+where(Pid) when is_pid(Pid) ->
+    Pid.
+
+%%--------------------------------------------------------------------
 
 start_link(Configuration) ->
     Owner = self(),
@@ -74,59 +88,61 @@ start(Configuration) ->
 
 %%--------------------------------------------------------------------
 
-get_resource(ResourcePool) ->
-    get_resource(ResourcePool,self()).
+get_resource(GroupNameOrPid) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    get_resource(where(GroupNameOrPid),self()).
 
-get_resource(ResourcePool,ClientPID) ->
-    gen_server:call(ResourcePool,{get_resource,ClientPID},infinity).
+get_resource(GroupNameOrPid,ClientPID) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid),
+				       is_pid(ClientPID) ->
+    gen_server:call(where(GroupNameOrPid),{get_resource,ClientPID},infinity).
 
-get_configuration(ResourcePool) ->
-    gen_server:call(ResourcePool,get_configuration).
+get_configuration(GroupNameOrPid) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),get_configuration).
 
 %%----------------
-release_resource(ResourcePool,Resource) ->
-    gen_server:call(ResourcePool,{release_resource,Resource},infinity).
+release_resource(GroupNameOrPid,Resource) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),{release_resource,Resource},infinity).
 
-release_resource(ResourcePool,Resource,WatcherPid) ->
-    gen_server:call(ResourcePool,{release_resource,Resource,WatcherPid},infinity).
+release_resource(GroupNameOrPid,Resource,WatcherPid) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),{release_resource,Resource,WatcherPid},infinity).
 
 
 
 %%--------------------------------------------------------------------
-%% Function: resource_count(ResourcePool) -> {ok,ResourceCount}
+%% Function: resource_count(GroupNameOrPid) -> {ok,ResourceCount}
 %%--------------------------------------------------------------------
 %%   ResourceCount = integer() The number of resource processes
 %%                               currently started.
 %%--------------------------------------------------------------------
 
-resource_count(ResourcePool) ->
-    gen_server:call(ResourcePool,resource_count,infinity).
+resource_count(GroupNameOrPid) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),resource_count,infinity).
 
 %%--------------------------------------------------------------------
-%% Function: is_online(ResourcePool,Resource) -> true | false
+%% Function: is_online(GroupName,Resource) -> true | false
 %%--------------------------------------------------------------------
 
-is_online(ResourcePool,Resource) ->
-    gen_server:call(ResourcePool,{is_state,online,Resource},infinity).
-
-
+is_online(GroupNameOrPid,Resource) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),{is_state,online,Resource},infinity).
 
 %%====================================================================
 %% API (Internal)
 %%====================================================================
 
-'$register_completion'(ResourcePool,CompletionFun) ->
-    gen_server:call(ResourcePool,{register_completion,CompletionFun},infinity).
+'$register_completion'(GroupNameOrPid,CompletionFun) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),{register_completion,CompletionFun},infinity).
 
 %%--------------------------------------------------------------------
 
-'$notify_resource_state'(ResourcePool,Status) ->
-    gen_server:cast(ResourcePool,{notify_resource_state,Status,self()}).
+'$notify_resource_state'(GroupNameOrPid,Status) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:cast(where(GroupNameOrPid),{notify_resource_state,Status,self()}).
+
+resource_change_state(GroupNameOrPid,Status) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    '$notify_resource_state'(where(GroupNameOrPid),Status).
 
 %%--------------------------------------------------------------------
 
-'$get_all_resources'(ResourcePool) ->
-    gen_server:call(ResourcePool,get_all_resources,infinity).
+'$get_all_resources'(GroupNameOrPid) when is_atom(GroupNameOrPid); is_pid(GroupNameOrPid) ->
+    gen_server:call(where(GroupNameOrPid),get_all_resources,infinity).
 
 %%====================================================================
 %% gen_server callbacks
@@ -142,27 +158,25 @@ is_online(ResourcePool,Resource) ->
 init([Owner,Configuration = #pool{}]) ->
     process_flag(trap_exit,true),
     Name = Configuration#pool.name,
-    Type = Configuration#pool.pool_type,
-
-    {ok,ResourceSupervisor} = sqldb_resource_sup:start_link(),
-
-    UpdConfig = Configuration#pool { resource_pool_pid = self()},
-    State = #state { configuration     = UpdConfig,
+    _Type = Configuration#pool.pool_type,
+    BehaviourMod = Configuration#pool.resource_behaviour_module,
+    gproc:reg({n,l,{pool_manager, Name}}),
+    {ok, ResourceSupervisor} = gen_pool_resource_sup:start_link(),
+    {ok, BehaviourState} = BehaviourMod:init(Configuration),
+    State = #state { configuration     = Configuration,
+		     behaviour_mod     = BehaviourMod,
 		     min_pool_size     = Configuration#pool.min_pool_size,
 		     max_pool_size     = Configuration#pool.max_pool_size,
 		     notify_completion = Configuration#pool.notify_completion,
 		     resource_sup      = ResourceSupervisor,
-		     owner             = Owner,
+		     resource_pool_pid = Owner,
+		     behaviour_state   = BehaviourState,
 		     debug             = Configuration#pool.debug,
-		     resources_table = ets:new(sqldb_resources, [ordered_set,protected])},
+		     resources_table = ets:new(pool_resources, [ordered_set,protected])},
 
-    ok = do_start_resources(State#state.min_pool_size,permanent,State),
-
-    init_pool_state(?STATE_UNDEFINED,State),
-
-    ok = mon:state(up),
-
-    {ok, State}.
+    {ok,NewState} = do_start_resources(State#state.min_pool_size,permanent,State),
+    init_pool_state(?STATE_UNDEFINED,NewState),
+    {ok, NewState}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -249,7 +263,7 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 
 terminate(Reason, State) ->
-    io:format("[SQLDB] [~s] ~p Resource pool shutting down with reason ~w\n",["Resource Pool",self(),Reason]),
+    io:format("[POOL] [~s] ~p Resource pool shutting down with reason ~w\n",["Resource Pool",self(),Reason]),
     Sup = State#state.resource_sup,
     Mon = erlang:monitor(process,Sup),
     exit(Sup,shutdown),
@@ -259,7 +273,7 @@ terminate(Reason, State) ->
     end,
 
     set_pool_state(?STATE_DOWN,State),
-    io:format("[SQLDB] [~s] ~p Resource pool shut down successfully\n",["Resource Pool",self()]),
+    io:format("[POOL] [~s] ~p Resource pool shut down successfully\n",["Resource Pool",self()]),
     log(resource_pool,"Resource pool is terminating (reason: ~p)\n",[Reason],State).
 
 %%--------------------------------------------------------------------
@@ -277,26 +291,25 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Startup X new resources
 %%--------------------------------------------------------------------
-
 do_start_resources(Count,Type,StateData) ->
-    Config = StateData#state.configuration,
-    PoolType = Config#pool.pool_type,
-    ResourceModule = sqldb_resource:resource_module(PoolType),
-
-    Configuration    = Config#pool{resource_behaviour = Type},  
-
+    Config         = StateData#state.configuration,
+    ResourceModule = Config#pool.resource_module,
+    Configuration  = Config#pool{resource_behaviour = Type},  
     do_start_resources(Count,Type,ResourceModule,Configuration,StateData).
 
 %%--------------------------------------------------------------------
 
 do_start_resources(_Count = 0,_Type,_ResourceModule,_Configuration,StateData) ->
     update_resource_count(StateData),
-    ok;
+    {ok,StateData};
 
 do_start_resources(Count,Type,ResourceModule,Configuration,StateData) ->
+    BehaviourState = StateData#state.behaviour_state,
+    BehaviourMod   = StateData#state.behaviour_mod,
     log(resource_pool,"starting new ~p resource",[Type],StateData), 
-    {ok,_Resource} = sqldb_resource_sup:start_resource(StateData#state.resource_sup,Type,ResourceModule,[Configuration]),
-    do_start_resources(Count-1,Type,ResourceModule,Configuration,StateData).
+    {ok,ResourceStartArgs, NewBehaviourState} = BehaviourMod:configure_next_resource(BehaviourState),
+    {ok,_Resource} = gen_pool_resource_sup:start_resource(StateData#state.resource_sup,Type,ResourceModule,ResourceStartArgs),
+    do_start_resources(Count-1,Type,ResourceModule,Configuration,StateData#state{behaviour_state = NewBehaviourState}).
 
 %%--------------------------------------------------------------------
 %% Notify when a resource enters online state, by calling the notify completion
@@ -336,19 +349,19 @@ do_handle_resource_state_change(State,ResourcePid,StateData) ->
 %% When the resource supervisor exist's we crash aswell
 %%--------------------------------------------------------------------
 
-do_handle_exit_signal(Pid,Reason,State) when (Pid == State#state.resource_sup) ->
+do_handle_exit_signal(Pid,_Reason,State) when (Pid == State#state.resource_sup) ->
     {stop,normal,State};
 
 %%--------------------------------------------------------------------
 %% Handle exit signal from resources
 %%   When a resource exist's we delete it from the resources ets table
 %%--------------------------------------------------------------------
-do_handle_exit_signal(Pid,shutdown,StateData) when Pid == StateData#state.owner ->
-    debug(sqldb_resource_pool,"resource pool got shutdown signal from connpool ~p",[Pid],StateData),
+do_handle_exit_signal(Pid,shutdown,StateData) when Pid == StateData#state.resource_pool_pid ->
+    debug(resource_pool,"resource pool got shutdown signal from resource pool ~p",[Pid],StateData),
     {stop,shutdown,StateData};
 
 do_handle_exit_signal(Pid,Reason,StateData) ->
-    log(sqldb_resource_pool,"resource pid: ~p existed with reason: ~p",[Pid,Reason],StateData),
+    log(resource_pool,"resource pid: ~p existed with reason: ~p",[Pid,Reason],StateData),
 
     true = ets:delete(StateData#state.resources_table,Pid),
 
@@ -479,24 +492,25 @@ has_max_resources(StateData) ->
 
 init_pool_state(State,StateData) ->
     Config = StateData#state.configuration,
-    ID      = Config#pool.id,
-    perfcounter:set({sqldb_pool,node(),Config#pool.pool_state},State).
+    %%ID      = Config#pool.id,
+    %%perfcounter:set({sqldb_pool,node(),Config#pool.pool_state},State).
+    ok.
 
 set_pool_state(State,StateData) ->
     Config = StateData#state.configuration,
-    ID      = Config#pool.id,
-    CounterName = {sqldb_pool,node(),ID,pool_state},
-
-    case perfcounter:value(CounterName) of
-	State -> %% The state did not change
-	    ok;
-	_OldState -> %% The state changed
-	    set_counter(pool_state,State,StateData),
-	    case State of
-		?STATE_UP   -> sqldb_snmp:sqlUp(ID);
-		?STATE_DOWN -> sqldb_snmp:sqlDown(ID)
-	    end
-    end.
+    %%ID      = Config#pool.id,
+    %%CounterName = {sqldb_pool,node(),ID,pool_state},
+    ok.
+%    case perfcounter:value(CounterName) of
+%	State -> %% The state did not change
+%	    ok;
+%	_OldState -> %% The state changed
+%	    set_counter(pool_state,State,StateData),
+%	    case State of
+%		?STATE_UP   -> sqldb_snmp:sqlUp(ID);
+%		?STATE_DOWN -> sqldb_snmp:sqlDown(ID)
+%	    end
+%    end.
 
 update_resource_counters(StateData) ->
     Results = ets:select(StateData#state.resources_table,[{{'$1','$2','$3','$4'},[],['$_']}]),
@@ -530,8 +544,9 @@ update_resource_count(StateData) ->
 
 set_counter(CounterName,Value,StateData) ->
     Config = StateData#state.configuration,
-    ID      = Config#pool.id,
-    perfcounter:set({sqldb_pool,node(),ID,CounterName},Value).
+%%    ID      = Config#pool.id,
+    %perfcounter:set({sqldb_pool,node(),ID,CounterName},Value).
+    ok.
 
 %%--------------------------------------------------------------------
 
@@ -573,7 +588,7 @@ log(Type,Message,Parameters,StateData) ->
 %%--------------------------------------------------------------------
 
 debug(Type,Message,Parameters,StateData) when StateData#state.debug == true ->
-    io:format("[SQLDB] [~p] "++Message++"\n",[Type|Parameters]);
+    io:format("[POOL] [~p] "++Message++"\n",[Type|Parameters]);
 
 debug(_Type,_Message,_Parameters,_StateData) ->
     ok.

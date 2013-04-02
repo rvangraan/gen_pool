@@ -5,8 +5,7 @@
 %%% @end
 %%% Created : 15 Mar 2013 by Rudolph van Graan <rvg@wyemac.local>
 
--module(gen_pool_manager).
-
+-module(gen_pool).
 
 %%--------------------------------------------------------------------
 -behaviour(gen_server).
@@ -26,12 +25,14 @@
 	 acquire/1,
 	 acquire/2,
 	 get_allocated_resource/0,
-	 get_dialect/1,
 	 release/0,
 	 is_allocated/2,
+	 wait_for/2,
+	 wait_timeout/1,
 	 get_pending_allocation_count/1,
 	 get_pending_allocations/1,
 	 get_configuration/1]).
+
 %%--------------------------------------------------------------------
 %% API (internal)
 %%--------------------------------------------------------------------
@@ -40,6 +41,7 @@
 	 '$get_resource'/2,
 	 '$release_resource'/2,
 	 '$notify_resource_state'/2]).
+
 %%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
@@ -49,13 +51,14 @@
 	 handle_info/2,
 	 terminate/2, 
 	 code_change/3]).
+
 %%--------------------------------------------------------------------
 
 %%--------------------------------------------------------------------
 %% Configuration
-%% name:                 string() The sqldb pool name is used to identify a group/pool of connections
+%% name:                 string() The pool name is used to identify a group/pool of connections
 %%                                of the same type and startup configuration.
-%% connection_pool_pid:  pid()    The connection pool pid
+%% resource_pool_pid:  pid()      The resource pool pid
 %% pending_allocations:  term()   ets table keeping track of pending connection allocations
 %%--------------------------------------------------------------------
 -record(state, {name,
@@ -66,6 +69,7 @@
 		allocation_timeout,
 		own_resource_pool,
 		resource_pool_pid,
+		wait_for_queue = [],
 		pending_allocations}).
 
 %%====================================================================
@@ -95,11 +99,11 @@ start(Config = #pool{}) ->
 %% Start a Pool for another running connection pool
 %%--------------------------------------------------------------------
 
-start_link(Config = #pool{} ,ResourcePool) ->
+start_link(Config = #pool{}, ResourcePool) ->
     Owner = self(), 
     gen_server:start_link(?MODULE, [Owner,Config,ResourcePool], []).
 
-start(Config = #pool{},ResourcePool) ->
+start(Config = #pool{}, ResourcePool) ->
     Owner = self(), 
     gen_server:start(?MODULE, [Owner,Config,ResourcePool], []).
 
@@ -107,6 +111,10 @@ start(Config = #pool{},ResourcePool) ->
 
 stop(Pool) ->
     call_pool(Pool,stop,5000).
+
+%%--------------------------------------------------------------------
+wait_for(PoolName,Timeout) when is_integer(Timeout) ->
+    call_pool(PoolName, {wait_for,Timeout},infinity).
 
 %%--------------------------------------------------------------------
 
@@ -175,9 +183,8 @@ is_allocated(Pool,{_Type,Pid} = Resource) when is_pid(Pid)->
 is_allocated(_PoolName,_Resource) ->
     exit(badarg).
 
-
-get_dialect(PoolName) ->
-    call_pool(PoolName,get_dialect,?CALLTIMEOUT).
+wait_timeout(From) ->
+    gen_server:reply(From,{error,timeout}).
 
 %%====================================================================
 %% Resource Management API (Internal)
@@ -209,7 +216,7 @@ get_dialect(PoolName) ->
 
 call_pool(Name,Message,Timeout) ->
     try
-	case proc_reg:where({pool,Name}) of
+	case gproc:where({n, l, {gen_pool,Name}}) of
 	    undefined ->
 		throw(unknown_pool);
 	    Pid ->
@@ -235,32 +242,32 @@ call_pool(Name,Message,Timeout) ->
 %%--------------------------------------------------------------------
 init([Owner,Config = #pool{}]) ->
     {ok,ResourcePool} = gen_pool_resource_manager:start_link(Config),
+    
     %%  log(status,"Connection pool ~p started",[ConnectionPool],#state{debug=true}),
-    Config2 = Config#pool{resource_pool_pid = ResourcePool},
-    init([Owner,Config2,ResourcePool,true]);
+    init([Owner,Config,ResourcePool,true]);
 
-init([Owner,Configuration,ResourcePool]) ->
-    init([Owner,Configuration,ResourcePool,_OwnTheResourcePool = false]);
 init([Owner,Configuration,ResourcePool,OwnTheResourcePool]) ->
     process_flag(trap_exit,true),
-    %%  log(status,"Connection pool ~p started",[ConnectionPool],#state{debug=true}),
+    Name = Configuration#pool.name, 
+    
+    log(status,"Resource pool ~p started ~p",[Name,ResourcePool],#state{debug=true}),
 
     MyPid = self(),
 
-    Name = Configuration#pool.name, 
-    true = proc_reg:reg({pool,Name},MyPid),
+    true = gproc:reg({n, l, {gen_pool,Name}}),
+    true = gproc:reg({p, l, {gen_pool,pool_type}}, Configuration#pool.pool_type),
 
     F = fun(State) ->
 		gen_pool_manager:'$notify_resource_state'(MyPid,State)
 	end,
-    %%  log(status,"Registering completion for connection pool ~p",[ConnectionPool],#state{debug=true}),
+    
+    %% log(status,"Registering completion for connection pool ~p",[ResourcePool],#state{debug=true}),
     ok = gen_pool_resource_manager:'$register_completion'(ResourcePool,F),
 
     %%  log(status,"Started",[],#state{debug=true}),
  
     {ok, #state{ name                = Name,
 		 own_resource_pool   = OwnTheResourcePool,
-		 pool_type           = Configuration#pool.pool_type,
 		 allocation_timeout  = Configuration#pool.allocation_timeout,
 		 debug               = Configuration#pool.debug,
 		 resource_pool_pid   = ResourcePool,
@@ -272,13 +279,13 @@ handle_call(get_configuration, _From, State) ->
     {ok,Configuration} = gen_pool_resource_manager:get_configuration(State#state.resource_pool_pid),
     {reply,{ok,Configuration},State};
 
-handle_call(get_connection_pool, _From, State) ->
+handle_call(get_resource_pool, _From, State) ->
     {reply,{ok,State#state.resource_pool_pid},State};
 
 handle_call(get_resource, From, State) ->
     do_get_resource(From,State#state.allocation_timeout,State);
 
-handle_call({get_connection,Timeout}, From, State) ->
+handle_call({get_resource,Timeout}, From, State) ->
     do_get_resource(From,Timeout,State);
 
 %%--------------------------------------------------------------------
@@ -305,6 +312,12 @@ handle_call(get_pending_allocation_count,_From,State) ->
 handle_call(get_pending_allocations,_From,State) ->
     PendingAllocations = ets:tab2list(State#state.pending_allocations),
     {reply,PendingAllocations,State};
+
+%%--------------------------------------------------------------------
+handle_call({wait_for, Timeout},From,#state{wait_for_queue = WaitForQueue} = State) ->
+    case gen_pool_resource_manager:is_online(State#state.resource_pool_pid)
+    {ok, Timer} = timer:apply_after(Timeout,?MODULE,wait_timeout,[From]),
+    {noreply,State#state{wait_for_queue = [{From,Timer}|WaitForQueue]}};
 
 %%--------------------------------------------------------------------
 
@@ -342,7 +355,7 @@ handle_info({'EXIT',PID,_Reason}, State) ->
 %%--------------------------------------------------------------------
 
 terminate(Reason, State) when State#state.own_resource_pool == true->
-    io:format("[POOL] [~s] ~p pool ~s shutting down with reason ~w\n",["Pool",self(),State#state.name,Reason]),
+    io:format(user,"[POOL] [~s] ~p pool ~s shutting down with reason ~w\n",["Pool",self(),State#state.name,Reason]),
     ConnPool = State#state.resource_pool_pid,
     Mon = erlang:monitor(process,ConnPool),
     exit(ConnPool,shutdown),
@@ -350,11 +363,11 @@ terminate(Reason, State) when State#state.own_resource_pool == true->
 	{'DOWN', Mon, _, _, _} ->
 	    ok
     end,
-    io:format("[POOL] [~s] ~p pool ~s shut down\n",["Pool",self(),State#state.name]),
+    io:format(user,"[POOL] [~s] ~p pool ~s shut down\n",["Pool",self(),State#state.name]),
 
     log(status,"terminate reason: ~p",[Reason],State);
 terminate(Reason, State) ->
-    io:format("[POOL] [~s] ~p pool ~s shutting down with reason ~w (Resource pool is not owned!)\n",["Pool",self(),State#state.name,Reason]),
+    io:format(user,"[POOL] [~s] ~p pool ~s shutting down with reason ~w (Resource pool is not owned!)\n",["Pool",self(),State#state.name,Reason]),
     log(status,"terminate reason: ~p",[Reason],State).
 
 %%--------------------------------------------------------------------
@@ -490,7 +503,7 @@ log(Type,Message,Parameters,State) ->
 %%--------------------------------------------------------------------
 
 debug(Type,Message,Parameters,State) when State#state.debug == true ->
-    io:format("[POOL] [~p] ~p "++Message++"\n",[Type,self()|Parameters]);
+    io:format(user,"[POOL] [~p] ~p "++Message++"\n",[Type,self()|Parameters]);
 debug(_Type,_Message,_Parameters,_State) ->
     ok.
 
